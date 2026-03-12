@@ -23,7 +23,7 @@ static void print_processes(const Process *procs, int n, int ncpu)
 
     for (int i = 0; i < n; i++) {
         const Process *p = &procs[i];
-        printf("%s-bound process \"%s\": arrival time %dms; %d CPU burst%s:\n",
+        printf("%s-bound process %s: arrival time %dms; %d CPU burst%s:\n",
                p->cpu_bound ? "CPU" : "I/O",
                p->id,
                p->arrival_time,
@@ -40,10 +40,6 @@ static void print_processes(const Process *procs, int n, int ncpu)
         }
     }
 
-    /* Footer */
-    printf("<<< ends with %d CPU-bound process%s out of %d total process%s >>>\n",
-           ncpu, ncpu == 1 ? "" : "es",
-           n,    n    == 1 ? "" : "es");
 }
 
 int main(int argc, char *argv[])
