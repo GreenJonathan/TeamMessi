@@ -6,7 +6,7 @@
 static void print_processes(const Process *procs, int n, int ncpu,
                              long seed, double lambda, int upper_bound)
 {
-    /* Header lines */
+    /* print the header with all the info */
     printf("<<< -- process set (n=%d) with %d CPU-bound process%s\n",
            n, ncpu, ncpu == 1 ? "" : "es");
     printf("<<< -- seed=%ld; lambda=%.6f; upper bound=%d\n",
@@ -15,7 +15,7 @@ static void print_processes(const Process *procs, int n, int ncpu,
     for (int i = 0; i < n; i++) {
         const Process *p = &procs[i];
 
-        /* Blank line before each process */
+        /* blank line before each process to make it easier to read */
         printf("\n");
 
         printf("%s-bound process %s: arrival time %dms; %d CPU burst%s:\n",
@@ -30,6 +30,7 @@ static void print_processes(const Process *procs, int n, int ncpu,
                 printf("==> CPU burst %dms ==> I/O burst %dms\n",
                        p->cpu_bursts[b], p->io_bursts[b]);
             } else {
+                /* last burst has no I/O after it */
                 printf("==> CPU burst %dms\n", p->cpu_bursts[b]);
             }
         }
@@ -79,16 +80,16 @@ int main(int argc, char *argv[])
     }
     int upper_bound = (int)ub_l;
 
-    /* Seed the RNG once before generating processes */
+    /* seed the random number generator once at the start */
     srand48(seed);
 
-    /* Generate processes */
+    /* generate all the processes */
     Process *procs = generate_processes(n, ncpu, lambda, upper_bound);
 
-    /* Print output */
+    /* print everything out */
     print_processes(procs, n, ncpu, seed, lambda, upper_bound);
 
-    /* Cleanup */
+    /* free memory so valgrind doesnt yell at us */
     free_processes(procs, n);
 
     return EXIT_SUCCESS;
