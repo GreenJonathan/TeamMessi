@@ -176,7 +176,7 @@ int main(int argc, char *argv[])
 
     print_procset_stats(simout, procs, n, ncpu);
 
-    SimParams params = { t_cs, alpha, t_slice };
+    SimParams params = { t_cs, alpha, lambda, t_slice };
     int opt = (alpha <= 0.0);
 
     printf("\n<<< PROJECT SIMULATIONS\n\n");

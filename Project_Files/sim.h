@@ -8,6 +8,7 @@ typedef enum { ALGO_FCFS, ALGO_SJF, ALGO_SRT, ALGO_RR } AlgoType;
 typedef struct {
     int    t_cs;
     double alpha;
+    double lambda;
     int    t_slice;
 } SimParams;
 
