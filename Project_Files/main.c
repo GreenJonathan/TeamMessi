@@ -1,51 +1,45 @@
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include "process.h"
+#include "sim.h"
+#include "stats.h"
 
 static void print_processes(const Process *procs, int n, int ncpu,
-                             long seed, double lambda, int upper_bound)
+                            long seed, double lambda, int upper_bound,
+                            int t_cs, int opt_mode, double alpha, int t_slice)
 {
-    /* print the header with all the info */
     printf("<<< -- process set (n=%d) with %d CPU-bound process%s\n",
            n, ncpu, ncpu == 1 ? "" : "es");
     printf("<<< -- seed=%ld; lambda=%.6f; upper bound=%d\n",
            seed, lambda, upper_bound);
+    if (opt_mode)
+        printf("<<< -- t_cs=%dms; alpha=<n/a>; t_slice=%dms\n", t_cs, t_slice);
+    else
+        printf("<<< -- t_cs=%dms; alpha=%.6f; t_slice=%dms\n", t_cs, alpha, t_slice);
 
+    printf("\n");
     for (int i = 0; i < n; i++) {
         const Process *p = &procs[i];
-
-        /* blank line before each process to make it easier to read */
-        printf("\n");
-
-        printf("%s-bound process %s: arrival time %dms; %d CPU burst%s:\n",
+        printf("%s-bound process %s: arrival time %dms; %d CPU burst%s\n",
                p->cpu_bound ? "CPU" : "I/O",
                p->id,
                p->arrival_time,
                p->num_bursts,
                p->num_bursts == 1 ? "" : "s");
-
-        for (int b = 0; b < p->num_bursts; b++) {
-            if (b < p->num_bursts - 1) {
-                printf("==> CPU burst %dms ==> I/O burst %dms\n",
-                       p->cpu_bursts[b], p->io_bursts[b]);
-            } else {
-                /* last burst has no I/O after it */
-                printf("==> CPU burst %dms\n", p->cpu_bursts[b]);
-            }
-        }
     }
 }
 
 int main(int argc, char *argv[])
 {
-    if (argc != 6) {
+    if (argc != 9) {
         fprintf(stderr, "ERROR: Invalid number of arguments\n");
         return EXIT_FAILURE;
     }
 
     char *end;
-
     long n_l = strtol(argv[1], &end, 10);
     if (*end != '\0' || n_l < 1) {
         fprintf(stderr, "ERROR: Invalid number of processes\n");
@@ -80,17 +74,70 @@ int main(int argc, char *argv[])
     }
     int upper_bound = (int)ub_l;
 
-    /* seed the random number generator once at the start */
-    srand48(seed);
+    long tcs_l = strtol(argv[6], &end, 10);
+    if (*end != '\0' || tcs_l < 0) {
+        fprintf(stderr, "ERROR: Invalid context switch time\n");
+        return EXIT_FAILURE;
+    }
+    int t_cs = (int)tcs_l;
 
-    /* generate all the processes */
+    int    opt_mode = 0;
+    double alpha    = 0.0;
+    if (strcasecmp(argv[7], "n/a") == 0) {
+        opt_mode = 1;
+        alpha    = 0.0;
+    } else {
+        alpha = strtod(argv[7], &end);
+        if (*end != '\0' || alpha < 0.0 || alpha > 1.0) {
+            fprintf(stderr, "ERROR: Invalid alpha value\n");
+            return EXIT_FAILURE;
+        }
+    }
+
+    long slice_l = strtol(argv[8], &end, 10);
+    if (*end != '\0' || slice_l < 1) {
+        fprintf(stderr, "ERROR: Invalid time slice value\n");
+        return EXIT_FAILURE;
+    }
+    int t_slice = (int)slice_l;
+
+    srand48(seed);
     Process *procs = generate_processes(n, ncpu, lambda, upper_bound);
 
-    /* print everything out */
-    print_processes(procs, n, ncpu, seed, lambda, upper_bound);
+    print_processes(procs, n, ncpu, seed, lambda, upper_bound, t_cs, opt_mode, alpha, t_slice);
 
-    /* free memory so valgrind doesnt yell at us */
+    SimParams params = {
+        .t_cs         = t_cs,
+        .alpha        = alpha,
+        .t_slice      = t_slice,
+        .init_tau_ms  = (int)ceil(1.0 / lambda),
+    };
+
+    const char *names[4] = {
+        "FCFS",
+        opt_mode ? "SJF-OPT" : "SJF",
+        opt_mode ? "SRT-OPT" : "SRT",
+        "RR"
+    };
+
+    SimStats stats[4];
+    AlgoType order[4] = { ALGO_FCFS, ALGO_SJF, ALGO_SRT, ALGO_RR };
+
+    printf("\n<<< PROJECT SIMULATIONS\n\n");
+    for (int i = 0; i < 4; i++) {
+        run_simulation(procs, n, order[i], params, &stats[i]);
+        printf("\n");
+    }
+
+    FILE *fp = fopen("simout.txt", "w");
+    if (!fp) {
+        fprintf(stderr, "ERROR: could not open simout.txt for writing\n");
+        free_processes(procs, n);
+        return EXIT_FAILURE;
+    }
+    write_simout(fp, procs, n, ncpu, names, stats);
+    fclose(fp);
+
     free_processes(procs, n);
-
     return EXIT_SUCCESS;
 }

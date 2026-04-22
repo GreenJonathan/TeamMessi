@@ -9,6 +9,7 @@ typedef struct {
     int    t_cs;
     double alpha;
     int    t_slice;
+    int    init_tau_ms; /* ceil(1/lambda), used for SJF/SRT tau seed */
 } SimParams;
 
 typedef struct {
