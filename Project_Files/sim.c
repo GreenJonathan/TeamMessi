@@ -48,7 +48,8 @@ static SimProc *g_sp;   /* set before each simulation run */
 
 static int ev_lt(const Event *a, const Event *b) {
     if (a->time != b->time) return a->time < b->time;
-    if (a->type != b->type) return a->type < b->type;
+    if (a->type != b->type) re
+    turn a->type < b->type;
     return strcmp(g_sp[a->pidx].id, g_sp[b->pidx].id) < 0;
 }
 
