@@ -15,7 +15,8 @@ typedef struct {
     /* sim state */
     int  burst_idx;       /* index of the burst currently executing / next */
     int  remaining;       /* remaining ms in current CPU burst              */
-    int  ready_at;        /* time entered ready queue for this burst        */
+    int  ready_at;        /* time entered ready queue for this wait segment */
+    int  burst_ready_at;  /* original ready time for turnaround accounting  */
     int  cpu_start_time;  /* time this burst started on CPU                 */
     /* per-process stats */
     long total_wait;
@@ -231,6 +232,7 @@ static void run_fcfs(SimProc *sp, int n, SimParams p, SimStats *out) {
 
         case EV_ARRIVE:
             proc->ready_at = t;
+            proc->burst_ready_at = t;
             rq_push(pi);
             if (t <= PRINT_LIMIT) {
                 printf("time %dms: Process %s arrived; added to ready queue ", t, proc->id);
@@ -298,6 +300,7 @@ static void run_fcfs(SimProc *sp, int n, SimParams p, SimStats *out) {
 
         case EV_IO_DONE:
             proc->ready_at = t;
+            proc->burst_ready_at = t;
             rq_push(pi);
             if (t <= PRINT_LIMIT) {
                 printf("time %dms: Process %s completed I/O; added to ready queue ",
@@ -378,7 +381,7 @@ static void srt_preempt(int t, int pi, const char *source, int half, int opt,
     cur->num_preempt++;
     cur->event_token++;
     cur->cpu_start_time = 0;
-    cur->ready_at = t;
+    cur->ready_at = t + half;
 
     printf("time %dms: Process %s %s; preempting %s (remaining time %dms) ",
            t, g_sp[pi].id, source, cur->id, rem);
@@ -429,16 +432,19 @@ static void run_sjf_srt(SimProc *sp, int n, AlgoType algo, SimParams p,
         switch (e.type) {
         case EV_ARRIVE:
             proc->ready_at = t;
+            proc->burst_ready_at = t;
             proc->remaining = proc->cpu_bursts[proc->burst_idx];
             rq_push_sorted(pi, opt, preemptive);
             if (preemptive && srt_should_preempt(t, pi, cpu_running, opt)) {
                 srt_preempt(t, pi, "arrived", half, opt, &cpu_running,
                             &cpu_free_at, &cpu_busy);
             } else {
-                printf("time %dms: Process %s arrived; added to ready queue ",
-                       t, proc->id);
-                print_rq();
-                printf("\n");
+                if (t <= PRINT_LIMIT) {
+                    printf("time %dms: Process %s arrived; added to ready queue ",
+                           t, proc->id);
+                    print_rq();
+                    printf("\n");
+                }
             }
             if (cpu_running == -1)
                 do_dispatch(t, cpu_free_at, half, &cpu_running);
@@ -449,15 +455,17 @@ static void run_sjf_srt(SimProc *sp, int n, AlgoType algo, SimParams p,
             proc->cpu_start_time = t;
             proc->total_wait += (long)(t - half - proc->ready_at);
             proc->num_cs++;
-            if (proc->remaining == total) {
-                printf("time %dms: Process %s started using the CPU for %dms burst ",
-                       t, proc->id, proc->remaining);
-            } else {
-                printf("time %dms: Process %s started using the CPU for remaining %dms of %dms burst ",
-                       t, proc->id, proc->remaining, total);
+            if (t <= PRINT_LIMIT) {
+                if (proc->remaining == total) {
+                    printf("time %dms: Process %s started using the CPU for %dms burst ",
+                           t, proc->id, proc->remaining);
+                } else {
+                    printf("time %dms: Process %s started using the CPU for remaining %dms of %dms burst ",
+                           t, proc->id, proc->remaining, total);
+                }
+                print_rq();
+                printf("\n");
             }
-            print_rq();
-            printf("\n");
             Event de = { t + proc->remaining, EV_CPU_DONE, pi, proc->event_token };
             ev_push(de);
             break;
@@ -468,24 +476,25 @@ static void run_sjf_srt(SimProc *sp, int n, AlgoType algo, SimParams p,
             int bursts_left = proc->num_bursts - proc->burst_idx - 1;
 
             cpu_busy += (long)(t - proc->cpu_start_time);
-            proc->total_ta += (long)(t - proc->ready_at);
+            proc->total_ta += (long)(t + half - proc->burst_ready_at);
             proc->bursts_done++;
-
-            printf("time %dms: Process %s completed a CPU burst; %d burst%s to go ",
-                   t, proc->id, bursts_left, bursts_left == 1 ? "" : "s");
-            print_rq();
-            printf("\n");
 
             if (!opt)
                 proc->tau = ceil(p.alpha * actual + (1.0 - p.alpha) * proc->tau);
 
             if (bursts_left > 0) {
                 int io_done = t + half + proc->io_bursts[proc->burst_idx];
-                printf("time %dms: Process %s switching out of CPU; "
-                       "blocking on I/O until time %dms ",
-                       t, proc->id, io_done);
-                print_rq();
-                printf("\n");
+                if (t <= PRINT_LIMIT) {
+                    printf("time %dms: Process %s completed a CPU burst; %d burst%s to go ",
+                           t, proc->id, bursts_left, bursts_left == 1 ? "" : "s");
+                    print_rq();
+                    printf("\n");
+                    printf("time %dms: Process %s switching out of CPU; "
+                           "blocking on I/O until time %dms ",
+                           t, proc->id, io_done);
+                    print_rq();
+                    printf("\n");
+                }
                 Event ie = { io_done, EV_IO_DONE, pi, 0 };
                 ev_push(ie);
             } else {
@@ -509,16 +518,19 @@ static void run_sjf_srt(SimProc *sp, int n, AlgoType algo, SimParams p,
 
         case EV_IO_DONE:
             proc->ready_at = t;
+            proc->burst_ready_at = t;
             proc->remaining = proc->cpu_bursts[proc->burst_idx];
             rq_push_sorted(pi, opt, preemptive);
             if (preemptive && srt_should_preempt(t, pi, cpu_running, opt)) {
                 srt_preempt(t, pi, "completed I/O", half, opt, &cpu_running,
                             &cpu_free_at, &cpu_busy);
             } else {
-                printf("time %dms: Process %s completed I/O; added to ready queue ",
-                       t, proc->id);
-                print_rq();
-                printf("\n");
+                if (t <= PRINT_LIMIT) {
+                    printf("time %dms: Process %s completed I/O; added to ready queue ",
+                           t, proc->id);
+                    print_rq();
+                    printf("\n");
+                }
             }
             if (cpu_running == -1)
                 do_dispatch(t, cpu_free_at, half, &cpu_running);
