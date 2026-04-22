@@ -4,7 +4,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ── per-process simulation state ─────────────────────────────────────── */
 typedef struct {
     char id[4];
     int  cpu_bound;
@@ -12,39 +11,35 @@ typedef struct {
     int  num_bursts;
     int *cpu_bursts;
     int *io_bursts;
-    /* sim state */
-    int  burst_idx;       /* index of the burst currently executing / next */
-    int  remaining;       /* remaining ms in current CPU burst              */
-    int  ready_at;        /* time entered ready queue for this burst        */
-    int  cpu_start_time;  /* time this burst started on CPU                 */
-    /* per-process stats */
+    int  burst_idx;
+    int  remaining;
+    int  ready_at;
+    int  burst_rq_enter;
+    int  cpu_start_time;
     long total_wait;
     long total_ta;
     int  num_cs;
     int  num_preempt;
     int  bursts_done;
-    int  bursts_in_slice; /* RR: bursts completed without slice expiry      */
-    double tau;           /* SJF/SRT estimated CPU burst length             */
-    int  event_token;     /* invalidates stale CPU events after preemption  */
+    int  bursts_in_slice;
+    double tau;
+    int  run_gen;
 } SimProc;
 
-/* ── event queue (min-heap) ──────────────────────────────────────────── */
-
-/* Lower ordinal = higher priority when times are equal */
 typedef enum {
-    EV_CPU_START = 0,   /* process begins using CPU                        */
-    EV_ARRIVE    = 1,   /* process arrives for the first time              */
-    EV_IO_DONE   = 2,   /* process finishes I/O, re-enters ready queue     */
-    EV_CPU_DONE  = 3,   /* CPU burst completes                             */
-    EV_SLICE_EXP = 4    /* RR time-slice expires                           */
+    EV_CPU_START = 0,
+    EV_ARRIVE    = 1,
+    EV_IO_DONE   = 2,
+    EV_CPU_DONE  = 3,
+    EV_SLICE_EXP = 4
 } EvType;
 
-typedef struct { int time; EvType type; int pidx; int token; } Event;
+typedef struct { int time; EvType type; int pidx; int gen; } Event;
 
 #define MAX_EV 600000
-static Event   g_heap[MAX_EV];
-static int     g_hsize;
-static SimProc *g_sp;   /* set before each simulation run */
+static Event    g_heap[MAX_EV];
+static int      g_hsize;
+static SimProc *g_sp;
 
 static int ev_lt(const Event *a, const Event *b) {
     if (a->time != b->time) return a->time < b->time;
@@ -58,7 +53,7 @@ static void ev_push(Event e) {
     while (i > 0) {
         int p = (i - 1) / 2;
         if (ev_lt(&g_heap[i], &g_heap[p])) {
-            Event tmp = g_heap[i]; g_heap[i] = g_heap[p]; g_heap[p] = tmp;
+            Event t = g_heap[i]; g_heap[i] = g_heap[p]; g_heap[p] = t;
             i = p;
         } else break;
     }
@@ -69,36 +64,37 @@ static Event ev_pop(void) {
     g_heap[0] = g_heap[--g_hsize];
     int i = 0;
     for (;;) {
-        int l = 2*i+1, r = 2*i+2, m = i;
+        int l = 2 * i + 1, r = 2 * i + 2, m = i;
         if (l < g_hsize && ev_lt(&g_heap[l], &g_heap[m])) m = l;
         if (r < g_hsize && ev_lt(&g_heap[r], &g_heap[m])) m = r;
         if (m == i) break;
-        Event tmp = g_heap[i]; g_heap[i] = g_heap[m]; g_heap[m] = tmp;
+        Event t = g_heap[i]; g_heap[i] = g_heap[m]; g_heap[m] = t;
         i = m;
     }
     return ret;
 }
 
-/* ── FIFO ready queue ────────────────────────────────────────────────── */
 #define MAX_RQ 1000
 static int g_rq[MAX_RQ];
 static int g_rq_head, g_rq_tail;
 
-static void rq_init(void)      { g_rq_head = g_rq_tail = 0; }
-static void rq_push(int idx)   { g_rq[g_rq_tail++] = idx; }
-static int  rq_pop(void)       { return g_rq[g_rq_head++]; }
-static int  rq_empty(void)     { return g_rq_head == g_rq_tail; }
+static void rq_init(void) { g_rq_head = g_rq_tail = 0; }
+static void rq_push_tail(int idx) { g_rq[g_rq_tail++] = idx; }
+static int  rq_pop_head(void) { return g_rq[g_rq_head++]; }
+static int  rq_empty(void) { return g_rq_head == g_rq_tail; }
 
-static int rq_remove(int idx) {
-    for (int i = g_rq_head; i < g_rq_tail; i++) {
-        if (g_rq[i] == idx) {
-            for (int j = i; j < g_rq_tail - 1; j++)
-                g_rq[j] = g_rq[j + 1];
-            g_rq_tail--;
-            return 1;
-        }
+static void rq_insert_sorted(int idx, int (*key_fn)(SimProc *, int, int), int opt) {
+    int ins = g_rq_head;
+    while (ins < g_rq_tail) {
+        int j = g_rq[ins];
+        int ka = key_fn(g_sp, idx, opt);
+        int kb = key_fn(g_sp, j, opt);
+        if (ka < kb || (ka == kb && strcmp(g_sp[idx].id, g_sp[j].id) < 0)) break;
+        ins++;
     }
-    return 0;
+    memmove(&g_rq[ins + 1], &g_rq[ins], (size_t)(g_rq_tail - ins) * sizeof(g_rq[0]));
+    g_rq[ins] = idx;
+    g_rq_tail++;
 }
 
 static void print_rq(void) {
@@ -109,64 +105,28 @@ static void print_rq(void) {
     printf("]");
 }
 
-/* Dispatch the front of the ready queue.
- * cpu_free_at: the earliest time the CPU is free to accept a switch-in.
- * Sets *cpu_running to the dispatched process index and schedules EV_CPU_START.
- */
-static void do_dispatch(int cur_time, int cpu_free_at, int half_cs,
-                         int *cpu_running) {
-    if (rq_empty()) return;
-    int next   = rq_pop();
-    int start  = (cpu_free_at > cur_time ? cpu_free_at : cur_time) + half_cs;
-    *cpu_running = next;
-    Event se = { start, EV_CPU_START, next, g_sp[next].event_token };
-    ev_push(se);
-}
-
-/* ── algorithm name helper ───────────────────────────────────────────── */
-static const char *algo_name(AlgoType algo, int opt) {
-    switch (algo) {
-        case ALGO_FCFS: return "FCFS";
-        case ALGO_SJF:  return opt ? "SJF-OPT" : "SJF";
-        case ALGO_SRT:  return opt ? "SRT-OPT" : "SRT";
-        case ALGO_RR:   return "RR";
+static void print_rq_excluding(int ex) {
+    int any = 0;
+    for (int i = g_rq_head; i < g_rq_tail; i++) {
+        if (g_rq[i] == ex) continue;
+        if (!any) { printf("[Q:"); any = 1; }
+        printf(" %s", g_sp[g_rq[i]].id);
     }
-    return "?";
+    if (!any) printf("[Q: -]");
+    else printf("]");
 }
 
-static double sched_key(const SimProc *proc, int opt, int use_remaining) {
-    if (opt) {
-        if (use_remaining && proc->remaining > 0)
-            return (double)proc->remaining;
-        return (double)proc->cpu_bursts[proc->burst_idx];
-    }
-    return proc->tau;
+static int key_sjf(SimProc *sp, int i, int opt) {
+    if (opt) return sp[i].cpu_bursts[sp[i].burst_idx];
+    return (int)ceil(sp[i].tau - 1e-9);
 }
 
-static int sjf_lt(int a, int b, int opt, int use_remaining) {
-    double ka = sched_key(&g_sp[a], opt, use_remaining);
-    double kb = sched_key(&g_sp[b], opt, use_remaining);
-    if (ka != kb) return ka < kb;
-    return strcmp(g_sp[a].id, g_sp[b].id) < 0;
-}
-
-static void rq_push_sorted(int idx, int opt, int use_remaining) {
-    int pos = g_rq_tail;
-    while (pos > g_rq_head && sjf_lt(idx, g_rq[pos - 1], opt, use_remaining)) {
-        g_rq[pos] = g_rq[pos - 1];
-        pos--;
-    }
-    g_rq[pos] = idx;
-    g_rq_tail++;
-}
-
-static void collect_stats(SimProc *sp, int n, int sim_end, long cpu_busy,
-                          SimStats *out) {
-    long tw_cpu=0, tw_io=0;
-    long ta_cpu=0, ta_io=0;
-    int  cs_cpu=0, cs_io=0;
-    int  bd_cpu=0, bd_io=0;
-    int  pr_cpu=0, pr_io=0;
+static void collect_stats(SimProc *sp, int n, long cpu_busy, int sim_end,
+                          SimStats *out, int has_rr) {
+    long tw_cpu = 0, tw_io = 0, ta_cpu = 0, ta_io = 0;
+    int  cs_cpu = 0, cs_io = 0, bd_cpu = 0, bd_io = 0;
+    long bic_cpu = 0, bic_io = 0;
+    int  pr_cpu = 0, pr_io = 0;
 
     for (int i = 0; i < n; i++) {
         if (sp[i].cpu_bound) {
@@ -174,45 +134,67 @@ static void collect_stats(SimProc *sp, int n, int sim_end, long cpu_busy,
             ta_cpu += sp[i].total_ta;
             cs_cpu += sp[i].num_cs;
             bd_cpu += sp[i].bursts_done;
+            bic_cpu += sp[i].bursts_in_slice;
             pr_cpu += sp[i].num_preempt;
         } else {
-            tw_io  += sp[i].total_wait;
-            ta_io  += sp[i].total_ta;
-            cs_io  += sp[i].num_cs;
-            bd_io  += sp[i].bursts_done;
-            pr_io  += sp[i].num_preempt;
+            tw_io += sp[i].total_wait;
+            ta_io += sp[i].total_ta;
+            cs_io += sp[i].num_cs;
+            bd_io += sp[i].bursts_done;
+            bic_io += sp[i].bursts_in_slice;
+            pr_io += sp[i].num_preempt;
         }
     }
 
-    out->cpu_util    = (sim_end > 0) ? (double)cpu_busy / sim_end * 100.0 : 0.0;
+    out->cpu_util = (sim_end > 0) ? (double)cpu_busy / (double)sim_end * 100.0 : 0.0;
     out->avg_wait_cpu = bd_cpu ? (double)tw_cpu / bd_cpu : 0.0;
-    out->avg_wait_io  = bd_io  ? (double)tw_io  / bd_io  : 0.0;
-    out->avg_wait_all = (bd_cpu+bd_io) ? (double)(tw_cpu+tw_io)/(bd_cpu+bd_io) : 0.0;
-    out->avg_ta_cpu  = bd_cpu ? (double)ta_cpu / bd_cpu : 0.0;
-    out->avg_ta_io   = bd_io  ? (double)ta_io  / bd_io  : 0.0;
-    out->avg_ta_all  = (bd_cpu+bd_io) ? (double)(ta_cpu+ta_io)/(bd_cpu+bd_io) : 0.0;
-    out->cs_cpu      = cs_cpu;
-    out->cs_io       = cs_io;
-    out->cs_all      = cs_cpu + cs_io;
+    out->avg_wait_io  = bd_io  ? (double)tw_io / bd_io : 0.0;
+    out->avg_wait_all = (bd_cpu + bd_io) ? (double)(tw_cpu + tw_io) / (bd_cpu + bd_io) : 0.0;
+    out->avg_ta_cpu   = bd_cpu ? (double)ta_cpu / bd_cpu : 0.0;
+    out->avg_ta_io    = bd_io  ? (double)ta_io / bd_io : 0.0;
+    out->avg_ta_all   = (bd_cpu + bd_io) ? (double)(ta_cpu + ta_io) / (bd_cpu + bd_io) : 0.0;
+    out->cs_cpu = cs_cpu;
+    out->cs_io  = cs_io;
+    out->cs_all = cs_cpu + cs_io;
     out->preempt_cpu = pr_cpu;
     out->preempt_io  = pr_io;
     out->preempt_all = pr_cpu + pr_io;
-    out->has_rr_stats = 0;
+    out->has_rr_stats = has_rr;
+    if (has_rr) {
+        out->pct_slice_cpu = bd_cpu ? (double)bic_cpu / bd_cpu * 100.0 : 0.0;
+        out->pct_slice_io  = bd_io  ? (double)bic_io / bd_io * 100.0 : 0.0;
+        out->pct_slice_all = (bd_cpu + bd_io)
+            ? (double)(bic_cpu + bic_io) / (bd_cpu + bd_io) * 100.0 : 0.0;
+    } else {
+        out->pct_slice_cpu = out->pct_slice_io = out->pct_slice_all = 0.0;
+    }
 }
 
-/* ── FCFS simulation ─────────────────────────────────────────────────── */
-#define PRINT_LIMIT 10000
+static const char *algo_name(AlgoType algo, int opt) {
+    switch (algo) {
+    case ALGO_FCFS: return "FCFS";
+    case ALGO_SJF:  return opt ? "SJF-OPT" : "SJF";
+    case ALGO_SRT:  return opt ? "SRT-OPT" : "SRT";
+    case ALGO_RR:   return "RR";
+    }
+    return "?";
+}
+
+static void do_dispatch(int cur_time, int cpu_free_at, int half_cs, int *cpu_running) {
+    if (rq_empty()) return;
+    int next  = rq_pop_head();
+    int start = (cpu_free_at > cur_time ? cpu_free_at : cur_time) + half_cs;
+    *cpu_running = next;
+    ev_push((Event){ start, EV_CPU_START, next, 0 });
+}
 
 static void run_fcfs(SimProc *sp, int n, SimParams p, SimStats *out) {
     const int half = p.t_cs / 2;
     g_sp = sp;
-
     g_hsize = 0;
     rq_init();
-    for (int i = 0; i < n; i++) {
-        Event e = { sp[i].arrival_time, EV_ARRIVE, i, 0 };
-        ev_push(e);
-    }
+    for (int i = 0; i < n; i++)
+        ev_push((Event){ sp[i].arrival_time, EV_ARRIVE, i, 0 });
 
     int cpu_running = -1;
     int cpu_free_at = 0;
@@ -228,15 +210,13 @@ static void run_fcfs(SimProc *sp, int n, SimParams p, SimStats *out) {
         SimProc *proc = &sp[pi];
 
         switch (e.type) {
-
         case EV_ARRIVE:
             proc->ready_at = t;
-            rq_push(pi);
-            if (t <= PRINT_LIMIT) {
-                printf("time %dms: Process %s arrived; added to ready queue ", t, proc->id);
-                print_rq();
-                printf("\n");
-            }
+            proc->burst_rq_enter = t;
+            rq_push_tail(pi);
+            printf("time %dms: Process %s arrived; added to ready queue ", t, proc->id);
+            print_rq();
+            printf("\n");
             if (cpu_running == -1)
                 do_dispatch(t, cpu_free_at, half, &cpu_running);
             break;
@@ -244,240 +224,25 @@ static void run_fcfs(SimProc *sp, int n, SimParams p, SimStats *out) {
         case EV_CPU_START:
             proc->remaining      = proc->cpu_bursts[proc->burst_idx];
             proc->cpu_start_time = t;
-            proc->total_wait    += (long)(t - half - proc->ready_at);
-            proc->num_cs++;
-            if (t <= PRINT_LIMIT) {
-                printf("time %dms: Process %s started using the CPU for %dms burst ",
-                       t, proc->id, proc->remaining);
-                print_rq();
-                printf("\n");
-            }
-            {
-                Event de = { t + proc->remaining, EV_CPU_DONE, pi, proc->event_token };
-                ev_push(de);
-            }
-            break;
-
-        case EV_CPU_DONE: {
-            cpu_busy += (long)(t - proc->cpu_start_time);
-            int bursts_left = proc->num_bursts - proc->burst_idx - 1;
-            proc->total_ta += (long)(t + half - proc->ready_at);
-            proc->bursts_done++;
-
-            if (bursts_left > 0) {
-                int io_done = t + half + proc->io_bursts[proc->burst_idx];
-                if (t <= PRINT_LIMIT) {
-                    printf("time %dms: Process %s completed a CPU burst; %d burst%s to go ",
-                           t, proc->id, bursts_left, bursts_left == 1 ? "" : "s");
-                    print_rq();
-                    printf("\n");
-                    printf("time %dms: Process %s switching out of CPU; "
-                           "blocking on I/O until time %dms ",
-                           t, proc->id, io_done);
-                    print_rq();
-                    printf("\n");
-                }
-                Event ie = { io_done, EV_IO_DONE, pi, 0 };
-                ev_push(ie);
-            } else {
-                /* always print termination regardless of time */
-                printf("time %dms: Process %s terminated ", t, proc->id);
-                print_rq();
-                printf("\n");
-                sim_end = t + half;
-            }
-
-            proc->burst_idx++;
-            cpu_free_at  = t + half;
-            cpu_running  = -1;
-
-            if (!rq_empty())
-                do_dispatch(t, cpu_free_at, half, &cpu_running);
-            break;
-        }
-
-        case EV_IO_DONE:
-            proc->ready_at = t;
-            rq_push(pi);
-            if (t <= PRINT_LIMIT) {
-                printf("time %dms: Process %s completed I/O; added to ready queue ",
-                       t, proc->id);
-                print_rq();
-                printf("\n");
-            }
-            if (cpu_running == -1)
-                do_dispatch(t, cpu_free_at, half, &cpu_running);
-            break;
-
-        case EV_SLICE_EXP:
-            break;
-        }
-    }
-
-    printf("time %dms: Simulator ended for FCFS [Q: -]\n", sim_end);
-
-    /* ── collect stats ── */
-    long tw_cpu=0, tw_io=0;
-    long ta_cpu=0, ta_io=0;
-    int  cs_cpu=0, cs_io=0;
-    int  bd_cpu=0, bd_io=0;
-
-    for (int i = 0; i < n; i++) {
-        if (sp[i].cpu_bound) {
-            tw_cpu += sp[i].total_wait;
-            ta_cpu += sp[i].total_ta;
-            cs_cpu += sp[i].num_cs;
-            bd_cpu += sp[i].bursts_done;
-        } else {
-            tw_io  += sp[i].total_wait;
-            ta_io  += sp[i].total_ta;
-            cs_io  += sp[i].num_cs;
-            bd_io  += sp[i].bursts_done;
-        }
-    }
-
-    out->cpu_util    = (sim_end > 0) ? (double)cpu_busy / sim_end * 100.0 : 0.0;
-    out->avg_wait_cpu = bd_cpu ? (double)tw_cpu / bd_cpu : 0.0;
-    out->avg_wait_io  = bd_io  ? (double)tw_io  / bd_io  : 0.0;
-    out->avg_wait_all = (bd_cpu+bd_io) ? (double)(tw_cpu+tw_io)/(bd_cpu+bd_io) : 0.0;
-    out->avg_ta_cpu  = bd_cpu ? (double)ta_cpu / bd_cpu : 0.0;
-    out->avg_ta_io   = bd_io  ? (double)ta_io  / bd_io  : 0.0;
-    out->avg_ta_all  = (bd_cpu+bd_io) ? (double)(ta_cpu+ta_io)/(bd_cpu+bd_io) : 0.0;
-    out->cs_cpu      = cs_cpu;
-    out->cs_io       = cs_io;
-    out->cs_all      = cs_cpu + cs_io;
-    out->preempt_cpu = out->preempt_io = out->preempt_all = 0;
-    out->has_rr_stats = 0;
-}
-
-/* ── stub for unimplemented algorithms ──────────────────────────────── */
-static int srt_should_preempt(int t, int pi, int running, int opt) {
-    int elapsed, rem;
-    if (running == -1)
-        return 0;
-    if (g_sp[running].cpu_start_time == 0)
-        return 0;
-
-    elapsed = t - g_sp[running].cpu_start_time;
-    rem = g_sp[running].remaining - elapsed;
-    if (rem < 0) rem = 0;
-    return sched_key(&g_sp[pi], opt, 0) < (double)rem;
-}
-
-static void srt_preempt(int t, int pi, const char *source, int half, int opt,
-                        int *cpu_running, int *cpu_free_at, long *cpu_busy) {
-    int running = *cpu_running;
-    SimProc *cur = &g_sp[running];
-    int elapsed = cur->cpu_start_time ? t - cur->cpu_start_time : 0;
-    int rem = cur->remaining - elapsed;
-    if (rem < 0) rem = 0;
-
-    rq_remove(pi);
-    *cpu_busy += elapsed;
-    cur->remaining = rem;
-    cur->num_preempt++;
-    cur->event_token++;
-    cur->cpu_start_time = 0;
-    cur->ready_at = t;
-
-    printf("time %dms: Process %s %s; preempting %s (remaining time %dms) ",
-           t, g_sp[pi].id, source, cur->id, rem);
-    print_rq();
-    printf("\n");
-
-    rq_push_sorted(running, opt, 1);
-    rq_push_sorted(pi, opt, 1);
-    *cpu_running = -1;
-    *cpu_free_at = t + half;
-    do_dispatch(t, *cpu_free_at, half, cpu_running);
-}
-
-static void run_sjf_srt(SimProc *sp, int n, AlgoType algo, SimParams p,
-                        SimStats *out) {
-    const int half = p.t_cs / 2;
-    int opt = (p.alpha <= 0.0);
-    int preemptive = (algo == ALGO_SRT);
-    const char *name = algo_name(algo, opt);
-    double initial_tau = (p.lambda > 0.0) ? ceil(1.0 / p.lambda) : 1000.0;
-    g_sp = sp;
-
-    g_hsize = 0;
-    rq_init();
-    for (int i = 0; i < n; i++) {
-        sp[i].tau = initial_tau;
-        Event e = { sp[i].arrival_time, EV_ARRIVE, i, 0 };
-        ev_push(e);
-    }
-
-    int cpu_running = -1;
-    int cpu_free_at = 0;
-    int sim_end = 0;
-    long cpu_busy = 0;
-
-    printf("time 0ms: Simulator started for %s [Q: -]\n", name);
-
-    while (g_hsize > 0) {
-        Event e = ev_pop();
-        int t = e.time;
-        int pi = e.pidx;
-        SimProc *proc = &sp[pi];
-
-        if ((e.type == EV_CPU_START || e.type == EV_CPU_DONE) &&
-            e.token != proc->event_token)
-            continue;
-
-        switch (e.type) {
-        case EV_ARRIVE:
-            proc->ready_at = t;
-            proc->remaining = proc->cpu_bursts[proc->burst_idx];
-            rq_push_sorted(pi, opt, preemptive);
-            if (preemptive && srt_should_preempt(t, pi, cpu_running, opt)) {
-                srt_preempt(t, pi, "arrived", half, opt, &cpu_running,
-                            &cpu_free_at, &cpu_busy);
-            } else {
-                printf("time %dms: Process %s arrived; added to ready queue ",
-                       t, proc->id);
-                print_rq();
-                printf("\n");
-            }
-            if (cpu_running == -1)
-                do_dispatch(t, cpu_free_at, half, &cpu_running);
-            break;
-
-        case EV_CPU_START: {
-            int total = proc->cpu_bursts[proc->burst_idx];
-            proc->cpu_start_time = t;
             proc->total_wait += (long)(t - half - proc->ready_at);
             proc->num_cs++;
-            if (proc->remaining == total) {
-                printf("time %dms: Process %s started using the CPU for %dms burst ",
-                       t, proc->id, proc->remaining);
-            } else {
-                printf("time %dms: Process %s started using the CPU for remaining %dms of %dms burst ",
-                       t, proc->id, proc->remaining, total);
-            }
+            printf("time %dms: Process %s started using the CPU for %dms burst ",
+                   t, proc->id, proc->remaining);
             print_rq();
             printf("\n");
-            Event de = { t + proc->remaining, EV_CPU_DONE, pi, proc->event_token };
-            ev_push(de);
+            ev_push((Event){ t + proc->remaining, EV_CPU_DONE, pi, 0 });
             break;
-        }
 
         case EV_CPU_DONE: {
-            int actual = proc->cpu_bursts[proc->burst_idx];
-            int bursts_left = proc->num_bursts - proc->burst_idx - 1;
-
             cpu_busy += (long)(t - proc->cpu_start_time);
-            proc->total_ta += (long)(t - proc->ready_at);
+            int bursts_left = proc->num_bursts - proc->burst_idx - 1;
+            proc->total_ta += (long)(t + half - proc->burst_rq_enter);
             proc->bursts_done++;
 
             printf("time %dms: Process %s completed a CPU burst; %d burst%s to go ",
                    t, proc->id, bursts_left, bursts_left == 1 ? "" : "s");
             print_rq();
             printf("\n");
-
-            if (!opt)
-                proc->tau = ceil(p.alpha * actual + (1.0 - p.alpha) * proc->tau);
 
             if (bursts_left > 0) {
                 int io_done = t + half + proc->io_bursts[proc->burst_idx];
@@ -486,8 +251,7 @@ static void run_sjf_srt(SimProc *sp, int n, AlgoType algo, SimParams p,
                        t, proc->id, io_done);
                 print_rq();
                 printf("\n");
-                Event ie = { io_done, EV_IO_DONE, pi, 0 };
-                ev_push(ie);
+                ev_push((Event){ io_done, EV_IO_DONE, pi, 0 });
             } else {
                 printf("time %dms: Process %s terminated ", t, proc->id);
                 print_rq();
@@ -496,12 +260,8 @@ static void run_sjf_srt(SimProc *sp, int n, AlgoType algo, SimParams p,
             }
 
             proc->burst_idx++;
-            proc->remaining = bursts_left > 0 ? proc->cpu_bursts[proc->burst_idx] : 0;
-            proc->cpu_start_time = 0;
-            proc->event_token++;
-            cpu_free_at = t + half;
             cpu_running = -1;
-
+            cpu_free_at = t + half;
             if (!rq_empty())
                 do_dispatch(t, cpu_free_at, half, &cpu_running);
             break;
@@ -509,71 +269,331 @@ static void run_sjf_srt(SimProc *sp, int n, AlgoType algo, SimParams p,
 
         case EV_IO_DONE:
             proc->ready_at = t;
-            proc->remaining = proc->cpu_bursts[proc->burst_idx];
-            rq_push_sorted(pi, opt, preemptive);
-            if (preemptive && srt_should_preempt(t, pi, cpu_running, opt)) {
-                srt_preempt(t, pi, "completed I/O", half, opt, &cpu_running,
-                            &cpu_free_at, &cpu_busy);
-            } else {
-                printf("time %dms: Process %s completed I/O; added to ready queue ",
-                       t, proc->id);
-                print_rq();
-                printf("\n");
-            }
+            proc->burst_rq_enter = t;
+            rq_push_tail(pi);
+            printf("time %dms: Process %s completed I/O; added to ready queue ",
+                   t, proc->id);
+            print_rq();
+            printf("\n");
             if (cpu_running == -1)
                 do_dispatch(t, cpu_free_at, half, &cpu_running);
             break;
 
-        case EV_SLICE_EXP:
+        default:
             break;
         }
     }
 
-    printf("time %dms: Simulator ended for %s [Q: -]\n", sim_end, name);
-    collect_stats(sp, n, sim_end, cpu_busy, out);
+    collect_stats(sp, n, cpu_busy, sim_end, out, 0);
+    printf("time %dms: Simulator ended for FCFS [Q: -]\n", sim_end);
 }
 
-static void run_stub(SimProc *sp, int n, AlgoType algo, SimParams p,
-                     SimStats *out) {
-    (void)n; (void)p;
-    int opt = (p.alpha <= 0.0);
-    const char *name = algo_name(algo, opt);
-    printf("time 0ms: Simulator started for %s [Q: -]\n", name);
-    printf("time 0ms: Simulator ended for %s [Q: -]\n", name);
-    (void)sp;
-    memset(out, 0, sizeof(*out));
-}
+static void run_sjf_like(SimProc *sp, int n, SimParams p, SimStats *out,
+                         int preemptive, int opt) {
+    const int half = p.t_cs / 2;
+    g_sp = sp;
+    g_hsize = 0;
+    rq_init();
 
-/* ── public entry point ──────────────────────────────────────────────── */
-void run_simulation(const Process *procs, int n, AlgoType algo,
-                    SimParams params, SimStats *out) {
-    /* copy process data into SimProc array */
-    SimProc *sp = malloc(n * sizeof(SimProc));
-    if (!sp) { fprintf(stderr, "ERROR: malloc failed\n"); exit(EXIT_FAILURE); }
+    for (int i = 0; i < n; i++)
+        ev_push((Event){ sp[i].arrival_time, EV_ARRIVE, i, 0 });
 
-    for (int i = 0; i < n; i++) {
-        const Process *src = &procs[i];
-        memset(&sp[i], 0, sizeof(sp[i]));
-        strncpy(sp[i].id, src->id, sizeof(sp[i].id));
-        sp[i].cpu_bound    = src->cpu_bound;
-        sp[i].arrival_time = src->arrival_time;
-        sp[i].num_bursts   = src->num_bursts;
-        sp[i].cpu_bursts   = src->cpu_bursts;
-        sp[i].io_bursts    = src->io_bursts;
-        sp[i].burst_idx    = 0;
-        sp[i].remaining    = src->cpu_bursts[0];
+    int cpu_running = -1;
+    int cpu_free_at = 0;
+    int sim_end     = 0;
+    long cpu_busy   = 0;
+
+    printf("time 0ms: Simulator started for %s [Q: -]\n",
+           algo_name(preemptive ? ALGO_SRT : ALGO_SJF, opt));
+
+    while (g_hsize > 0) {
+        Event e = ev_pop();
+        int t  = e.time;
+        int pi = e.pidx;
+        SimProc *proc = &sp[pi];
+
+        switch (e.type) {
+        case EV_ARRIVE:
+        case EV_IO_DONE: {
+            proc->ready_at = t;
+            proc->burst_rq_enter = t;
+
+            if (preemptive && cpu_running != -1) {
+                SimProc *runp = &sp[cpu_running];
+                int run_key = opt ? runp->remaining : (int)ceil(runp->tau - 1e-9);
+                int new_key = opt ? proc->cpu_bursts[proc->burst_idx]
+                                  : (int)ceil(proc->tau - 1e-9);
+                if (new_key < run_key ||
+                    (new_key == run_key && strcmp(proc->id, runp->id) < 0)) {
+                    int remaining = runp->remaining - (t - runp->cpu_start_time);
+                    if (remaining < 0) remaining = 0;
+                    runp->remaining = remaining;
+                    runp->num_preempt++;
+                    cpu_busy += (long)(t - runp->cpu_start_time);
+                    rq_insert_sorted(cpu_running, key_sjf, opt);
+                    printf("time %dms: Process %s %s; preempting %s ", t, proc->id,
+                           e.type == EV_ARRIVE ? "arrived" : "completed I/O",
+                           runp->id);
+                    print_rq();
+                    printf("\n");
+                    rq_insert_sorted(pi, key_sjf, opt);
+                    cpu_running = -1;
+                    cpu_free_at = t + p.t_cs;
+                    if (!rq_empty())
+                        do_dispatch(t, cpu_free_at - half, half, &cpu_running);
+                    break;
+                }
+            }
+
+            rq_insert_sorted(pi, key_sjf, opt);
+            printf("time %dms: Process %s %s; added to ready queue ", t, proc->id,
+                   e.type == EV_ARRIVE ? "arrived" : "completed I/O");
+            print_rq();
+            printf("\n");
+            if (cpu_running == -1)
+                do_dispatch(t, cpu_free_at, half, &cpu_running);
+            break;
+        }
+
+        case EV_CPU_START: {
+            int burst_total = proc->cpu_bursts[proc->burst_idx];
+            if (proc->remaining == 0)
+                proc->remaining = burst_total;
+            proc->cpu_start_time = t;
+            proc->total_wait += (long)(t - half - proc->ready_at);
+            proc->num_cs++;
+            if (proc->remaining == burst_total)
+                printf("time %dms: Process %s started using the CPU for %dms burst ",
+                       t, proc->id, proc->remaining);
+            else
+                printf("time %dms: Process %s started using the CPU for remaining %dms of %dms burst ",
+                       t, proc->id, proc->remaining, burst_total);
+            print_rq();
+            printf("\n");
+            ev_push((Event){ t + proc->remaining, EV_CPU_DONE, pi, 0 });
+            break;
+        }
+
+        case EV_CPU_DONE: {
+            cpu_busy += (long)(t - proc->cpu_start_time);
+            int actual = proc->cpu_bursts[proc->burst_idx];
+            int bursts_left = proc->num_bursts - proc->burst_idx - 1;
+            proc->total_ta += (long)(t + half - proc->burst_rq_enter);
+            proc->bursts_done++;
+
+            printf("time %dms: Process %s completed a CPU burst; %d burst%s to go ",
+                   t, proc->id, bursts_left, bursts_left == 1 ? "" : "s");
+            print_rq();
+            printf("\n");
+
+            if (!opt) {
+                proc->tau = ceil(p.alpha * actual + (1.0 - p.alpha) * proc->tau - 1e-9);
+                printf("time %dms: Recalculated tau for process %s to %dms ", t,
+                       proc->id, (int)ceil(proc->tau - 1e-9));
+                print_rq();
+                printf("\n");
+            }
+
+            if (bursts_left > 0) {
+                int io_done = t + half + proc->io_bursts[proc->burst_idx];
+                printf("time %dms: Process %s switching out of CPU; blocking on I/O until time %dms ",
+                       t, proc->id, io_done);
+                print_rq();
+                printf("\n");
+                ev_push((Event){ io_done, EV_IO_DONE, pi, 0 });
+            } else {
+                printf("time %dms: Process %s terminated ", t, proc->id);
+                print_rq();
+                printf("\n");
+                sim_end = t + half;
+            }
+
+            proc->burst_idx++;
+            proc->remaining = 0;
+            cpu_running = -1;
+            cpu_free_at = t + half;
+            if (!rq_empty())
+                do_dispatch(t, cpu_free_at, half, &cpu_running);
+            break;
+        }
+
+        default:
+            break;
+        }
     }
 
+    collect_stats(sp, n, cpu_busy, sim_end, out, 0);
+    printf("time %dms: Simulator ended for %s [Q: -]\n",
+           sim_end, algo_name(preemptive ? ALGO_SRT : ALGO_SJF, opt));
+}
+
+static void run_rr(SimProc *sp, int n, SimParams p, SimStats *out) {
+    const int half = p.t_cs / 2;
+    g_sp = sp;
+    g_hsize = 0;
+    rq_init();
+    for (int i = 0; i < n; i++)
+        ev_push((Event){ sp[i].arrival_time, EV_ARRIVE, i, 0 });
+
+    int cpu_running = -1;
+    int cpu_free_at = 0;
+    int sim_end     = 0;
+    long cpu_busy   = 0;
+
+    printf("time 0ms: Simulator started for RR [Q: -]\n");
+
+    while (g_hsize > 0) {
+        Event e = ev_pop();
+        int t  = e.time;
+        int pi = e.pidx;
+        SimProc *proc = &sp[pi];
+
+        if (e.type != EV_ARRIVE && e.type != EV_IO_DONE && e.type != EV_CPU_START &&
+            cpu_running != pi)
+            continue;
+
+        switch (e.type) {
+        case EV_ARRIVE:
+            proc->ready_at = t;
+            proc->burst_rq_enter = t;
+            rq_push_tail(pi);
+            printf("time %dms: Process %s arrived; added to ready queue ", t, proc->id);
+            print_rq();
+            printf("\n");
+            if (cpu_running == -1)
+                do_dispatch(t, cpu_free_at, half, &cpu_running);
+            break;
+
+        case EV_IO_DONE:
+            proc->ready_at = t;
+            proc->burst_rq_enter = t;
+            rq_push_tail(pi);
+            printf("time %dms: Process %s completed I/O; added to ready queue ", t, proc->id);
+            print_rq();
+            printf("\n");
+            if (cpu_running == -1)
+                do_dispatch(t, cpu_free_at, half, &cpu_running);
+            break;
+
+        case EV_CPU_START: {
+            int burst_total = proc->cpu_bursts[proc->burst_idx];
+            if (proc->remaining == 0)
+                proc->remaining = burst_total;
+            proc->cpu_start_time = t;
+            proc->total_wait += (long)(t - half - proc->ready_at);
+            proc->num_cs++;
+            if (proc->remaining == burst_total)
+                printf("time %dms: Process %s started using the CPU for %dms burst ",
+                       t, proc->id, proc->remaining);
+            else
+                printf("time %dms: Process %s started using the CPU for remaining %dms of %dms burst ",
+                       t, proc->id, proc->remaining, burst_total);
+            print_rq();
+            printf("\n");
+
+            int run_for = proc->remaining < p.t_slice ? proc->remaining : p.t_slice;
+            ev_push((Event){ t + proc->remaining, EV_CPU_DONE, pi, 0 });
+            ev_push((Event){ t + run_for, EV_SLICE_EXP, pi, 0 });
+            break;
+        }
+
+        case EV_SLICE_EXP:
+            if (proc->remaining <= p.t_slice) {
+                proc->bursts_in_slice++;
+                break;
+            }
+            if (rq_empty()) {
+                printf("time %dms: Time slice expired; no preemption because ready queue is empty ",
+                       t);
+                print_rq();
+                printf("\n");
+                break;
+            }
+
+            proc->remaining -= p.t_slice;
+            proc->num_preempt++;
+            cpu_busy += p.t_slice;
+            rq_push_tail(pi);
+            printf("time %dms: Time slice expired; preempting process %s with %dms remaining ",
+                   t, proc->id, proc->remaining);
+            print_rq_excluding(pi);
+            printf("\n");
+            cpu_running = -1;
+            cpu_free_at = t + p.t_cs;
+            do_dispatch(t, cpu_free_at - half, half, &cpu_running);
+            break;
+
+        case EV_CPU_DONE: {
+            cpu_busy += proc->remaining;
+            proc->remaining = 0;
+            int bursts_left = proc->num_bursts - proc->burst_idx - 1;
+            proc->total_ta += (long)(t + half - proc->burst_rq_enter);
+            proc->bursts_done++;
+
+            printf("time %dms: Process %s completed a CPU burst; %d burst%s to go ",
+                   t, proc->id, bursts_left, bursts_left == 1 ? "" : "s");
+            print_rq();
+            printf("\n");
+
+            if (bursts_left > 0) {
+                int io_done = t + half + proc->io_bursts[proc->burst_idx];
+                printf("time %dms: Process %s switching out of CPU; blocking on I/O until time %dms ",
+                       t, proc->id, io_done);
+                print_rq();
+                printf("\n");
+                ev_push((Event){ io_done, EV_IO_DONE, pi, 0 });
+            } else {
+                printf("time %dms: Process %s terminated ", t, proc->id);
+                print_rq();
+                printf("\n");
+                sim_end = t + half;
+            }
+
+            proc->burst_idx++;
+            cpu_running = -1;
+            cpu_free_at = t + half;
+            if (!rq_empty())
+                do_dispatch(t, cpu_free_at, half, &cpu_running);
+            break;
+        }
+        }
+    }
+
+    collect_stats(sp, n, cpu_busy, sim_end, out, 1);
+    printf("time %dms: Simulator ended for RR [Q: -]\n", sim_end);
+}
+
+void run_simulation(const Process *procs, int n, AlgoType algo,
+                    SimParams params, SimStats *out) {
+    SimProc *sp = calloc((size_t)n, sizeof(*sp));
+    if (!sp) {
+        fprintf(stderr, "ERROR: calloc failed\n");
+        exit(EXIT_FAILURE);
+    }
+
+    for (int i = 0; i < n; i++) {
+        strcpy(sp[i].id, procs[i].id);
+        sp[i].cpu_bound    = procs[i].cpu_bound;
+        sp[i].arrival_time = procs[i].arrival_time;
+        sp[i].num_bursts   = procs[i].num_bursts;
+        sp[i].cpu_bursts   = procs[i].cpu_bursts;
+        sp[i].io_bursts    = procs[i].io_bursts;
+        sp[i].tau          = (double)params.init_tau_ms;
+    }
+
+    int opt = (params.alpha == 0.0);
     switch (algo) {
     case ALGO_FCFS:
         run_fcfs(sp, n, params, out);
         break;
     case ALGO_SJF:
-    case ALGO_SRT:
-        run_sjf_srt(sp, n, algo, params, out);
+        run_sjf_like(sp, n, params, out, 0, opt);
         break;
-    default:
-        run_stub(sp, n, algo, params, out);
+    case ALGO_SRT:
+        run_sjf_like(sp, n, params, out, 1, opt);
+        break;
+    case ALGO_RR:
+        run_rr(sp, n, params, out);
         break;
     }
 
