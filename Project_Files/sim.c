@@ -120,11 +120,12 @@ static const char *algo_name(AlgoType algo, int opt) {
 }
 
 /* ── FCFS simulation ─────────────────────────────────────────────────── */
+#define PRINT_LIMIT 10000
+
 static void run_fcfs(SimProc *sp, int n, SimParams p, SimStats *out) {
     const int half = p.t_cs / 2;
     g_sp = sp;
 
-    /* seed the event heap */
     g_hsize = 0;
     rq_init();
     for (int i = 0; i < n; i++) {
@@ -132,10 +133,10 @@ static void run_fcfs(SimProc *sp, int n, SimParams p, SimStats *out) {
         ev_push(e);
     }
 
-    int cpu_running = -1;  /* index of running process; -1 = idle         */
-    int cpu_free_at = 0;   /* earliest time CPU is free after switch-out   */
+    int cpu_running = -1;
+    int cpu_free_at = 0;
     int sim_end     = 0;
-    long cpu_busy   = 0;   /* total ms CPU was executing                   */
+    long cpu_busy   = 0;
 
     printf("time 0ms: Simulator started for FCFS [Q: -]\n");
 
@@ -150,9 +151,11 @@ static void run_fcfs(SimProc *sp, int n, SimParams p, SimStats *out) {
         case EV_ARRIVE:
             proc->ready_at = t;
             rq_push(pi);
-            printf("time %dms: Process %s arrived; added to ready queue ", t, proc->id);
-            print_rq();
-            printf("\n");
+            if (t <= PRINT_LIMIT) {
+                printf("time %dms: Process %s arrived; added to ready queue ", t, proc->id);
+                print_rq();
+                printf("\n");
+            }
             if (cpu_running == -1)
                 do_dispatch(t, cpu_free_at, half, &cpu_running);
             break;
@@ -162,10 +165,12 @@ static void run_fcfs(SimProc *sp, int n, SimParams p, SimStats *out) {
             proc->cpu_start_time = t;
             proc->total_wait    += (long)(t - half - proc->ready_at);
             proc->num_cs++;
-            printf("time %dms: Process %s started using the CPU for %dms burst ",
-                   t, proc->id, proc->remaining);
-            print_rq();
-            printf("\n");
+            if (t <= PRINT_LIMIT) {
+                printf("time %dms: Process %s started using the CPU for %dms burst ",
+                       t, proc->id, proc->remaining);
+                print_rq();
+                printf("\n");
+            }
             {
                 Event de = { t + proc->remaining, EV_CPU_DONE, pi };
                 ev_push(de);
@@ -175,24 +180,26 @@ static void run_fcfs(SimProc *sp, int n, SimParams p, SimStats *out) {
         case EV_CPU_DONE: {
             cpu_busy += (long)(t - proc->cpu_start_time);
             int bursts_left = proc->num_bursts - proc->burst_idx - 1;
-            proc->total_ta += (long)(t - proc->ready_at);
+            proc->total_ta += (long)(t + half - proc->ready_at);
             proc->bursts_done++;
-
-            printf("time %dms: Process %s completed a CPU burst; %d burst%s to go ",
-                   t, proc->id, bursts_left, bursts_left == 1 ? "" : "s");
-            print_rq();
-            printf("\n");
 
             if (bursts_left > 0) {
                 int io_done = t + half + proc->io_bursts[proc->burst_idx];
-                printf("time %dms: Process %s switching out of CPU; "
-                       "blocking on I/O until time %dms ",
-                       t, proc->id, io_done);
-                print_rq();
-                printf("\n");
+                if (t <= PRINT_LIMIT) {
+                    printf("time %dms: Process %s completed a CPU burst; %d burst%s to go ",
+                           t, proc->id, bursts_left, bursts_left == 1 ? "" : "s");
+                    print_rq();
+                    printf("\n");
+                    printf("time %dms: Process %s switching out of CPU; "
+                           "blocking on I/O until time %dms ",
+                           t, proc->id, io_done);
+                    print_rq();
+                    printf("\n");
+                }
                 Event ie = { io_done, EV_IO_DONE, pi };
                 ev_push(ie);
             } else {
+                /* always print termination regardless of time */
                 printf("time %dms: Process %s terminated ", t, proc->id);
                 print_rq();
                 printf("\n");
@@ -211,16 +218,18 @@ static void run_fcfs(SimProc *sp, int n, SimParams p, SimStats *out) {
         case EV_IO_DONE:
             proc->ready_at = t;
             rq_push(pi);
-            printf("time %dms: Process %s completed I/O; added to ready queue ",
-                   t, proc->id);
-            print_rq();
-            printf("\n");
+            if (t <= PRINT_LIMIT) {
+                printf("time %dms: Process %s completed I/O; added to ready queue ",
+                       t, proc->id);
+                print_rq();
+                printf("\n");
+            }
             if (cpu_running == -1)
                 do_dispatch(t, cpu_free_at, half, &cpu_running);
             break;
 
         case EV_SLICE_EXP:
-            break; /* not used in FCFS */
+            break;
         }
     }
 
