@@ -30,8 +30,9 @@ typedef enum {
     EV_CPU_START = 0,
     EV_ARRIVE    = 1,
     EV_IO_DONE   = 2,
-    EV_CPU_DONE  = 3,
-    EV_SLICE_EXP = 4
+    EV_RR_REQUEUE = 3,
+    EV_CPU_DONE  = 4,
+    EV_SLICE_EXP = 5
 } EvType;
 
 typedef struct { int time; EvType type; int pidx; int gen; } Event;
@@ -105,19 +106,11 @@ static void print_rq(void) {
     printf("]");
 }
 
-static void print_rq_excluding(int ex) {
-    int any = 0;
-    for (int i = g_rq_head; i < g_rq_tail; i++) {
-        if (g_rq[i] == ex) continue;
-        if (!any) { printf("[Q:"); any = 1; }
-        printf(" %s", g_sp[g_rq[i]].id);
-    }
-    if (!any) printf("[Q: -]");
-    else printf("]");
-}
-
 static int key_sjf(SimProc *sp, int i, int opt) {
-    if (opt) return sp[i].cpu_bursts[sp[i].burst_idx];
+    if (opt) {
+        if (sp[i].remaining > 0) return sp[i].remaining;
+        return sp[i].cpu_bursts[sp[i].burst_idx];
+    }
     return (int)ceil(sp[i].tau - 1e-9);
 }
 
@@ -185,7 +178,8 @@ static void do_dispatch(int cur_time, int cpu_free_at, int half_cs, int *cpu_run
     int next  = rq_pop_head();
     int start = (cpu_free_at > cur_time ? cpu_free_at : cur_time) + half_cs;
     *cpu_running = next;
-    ev_push((Event){ start, EV_CPU_START, next, 0 });
+    g_sp[next].run_gen++;
+    ev_push((Event){ start, EV_CPU_START, next, g_sp[next].run_gen });
 }
 
 static void run_fcfs(SimProc *sp, int n, SimParams p, SimStats *out) {
@@ -209,6 +203,9 @@ static void run_fcfs(SimProc *sp, int n, SimParams p, SimStats *out) {
         int pi = e.pidx;
         SimProc *proc = &sp[pi];
 
+        if (e.gen != 0 && e.gen != proc->run_gen)
+            continue;
+
         switch (e.type) {
         case EV_ARRIVE:
             proc->ready_at = t;
@@ -230,7 +227,7 @@ static void run_fcfs(SimProc *sp, int n, SimParams p, SimStats *out) {
                    t, proc->id, proc->remaining);
             print_rq();
             printf("\n");
-            ev_push((Event){ t + proc->remaining, EV_CPU_DONE, pi, 0 });
+            ev_push((Event){ t + proc->remaining, EV_CPU_DONE, pi, proc->run_gen });
             break;
 
         case EV_CPU_DONE: {
@@ -312,6 +309,9 @@ static void run_sjf_like(SimProc *sp, int n, SimParams p, SimStats *out,
         int pi = e.pidx;
         SimProc *proc = &sp[pi];
 
+        if (e.gen != 0 && e.gen != proc->run_gen)
+            continue;
+
         switch (e.type) {
         case EV_ARRIVE:
         case EV_IO_DONE: {
@@ -328,8 +328,10 @@ static void run_sjf_like(SimProc *sp, int n, SimParams p, SimStats *out,
                     int remaining = runp->remaining - (t - runp->cpu_start_time);
                     if (remaining < 0) remaining = 0;
                     runp->remaining = remaining;
+                    runp->ready_at = t;
                     runp->num_preempt++;
                     cpu_busy += (long)(t - runp->cpu_start_time);
+                    runp->run_gen++;
                     rq_insert_sorted(cpu_running, key_sjf, opt);
                     printf("time %dms: Process %s %s; preempting %s ", t, proc->id,
                            e.type == EV_ARRIVE ? "arrived" : "completed I/O",
@@ -360,7 +362,8 @@ static void run_sjf_like(SimProc *sp, int n, SimParams p, SimStats *out,
             if (proc->remaining == 0)
                 proc->remaining = burst_total;
             proc->cpu_start_time = t;
-            proc->total_wait += (long)(t - half - proc->ready_at);
+            if (proc->remaining == burst_total)
+                proc->total_wait += (long)(t - half - proc->ready_at);
             proc->num_cs++;
             if (proc->remaining == burst_total)
                 printf("time %dms: Process %s started using the CPU for %dms burst ",
@@ -370,7 +373,7 @@ static void run_sjf_like(SimProc *sp, int n, SimParams p, SimStats *out,
                        t, proc->id, proc->remaining, burst_total);
             print_rq();
             printf("\n");
-            ev_push((Event){ t + proc->remaining, EV_CPU_DONE, pi, 0 });
+            ev_push((Event){ t + proc->remaining, EV_CPU_DONE, pi, proc->run_gen });
             break;
         }
 
@@ -448,8 +451,7 @@ static void run_rr(SimProc *sp, int n, SimParams p, SimStats *out) {
         int pi = e.pidx;
         SimProc *proc = &sp[pi];
 
-        if (e.type != EV_ARRIVE && e.type != EV_IO_DONE && e.type != EV_CPU_START &&
-            cpu_running != pi)
+        if (e.gen != 0 && e.gen != proc->run_gen)
             continue;
 
         switch (e.type) {
@@ -475,6 +477,13 @@ static void run_rr(SimProc *sp, int n, SimParams p, SimStats *out) {
                 do_dispatch(t, cpu_free_at, half, &cpu_running);
             break;
 
+        case EV_RR_REQUEUE:
+            proc->ready_at = t;
+            rq_push_tail(pi);
+            if (cpu_running == -1)
+                do_dispatch(t, cpu_free_at, half, &cpu_running);
+            break;
+
         case EV_CPU_START: {
             int burst_total = proc->cpu_bursts[proc->burst_idx];
             if (proc->remaining == 0)
@@ -492,38 +501,47 @@ static void run_rr(SimProc *sp, int n, SimParams p, SimStats *out) {
             printf("\n");
 
             int run_for = proc->remaining < p.t_slice ? proc->remaining : p.t_slice;
-            ev_push((Event){ t + proc->remaining, EV_CPU_DONE, pi, 0 });
-            ev_push((Event){ t + run_for, EV_SLICE_EXP, pi, 0 });
+            ev_push((Event){ t + proc->remaining, EV_CPU_DONE, pi, proc->run_gen });
+            ev_push((Event){ t + run_for, EV_SLICE_EXP, pi, proc->run_gen });
             break;
         }
 
         case EV_SLICE_EXP:
             if (proc->remaining <= p.t_slice) {
-                proc->bursts_in_slice++;
                 break;
             }
             if (rq_empty()) {
+                proc->remaining -= p.t_slice;
+                cpu_busy += p.t_slice;
+                proc->cpu_start_time = t;
+                proc->run_gen++;
                 printf("time %dms: Time slice expired; no preemption because ready queue is empty ",
                        t);
                 print_rq();
                 printf("\n");
+                ev_push((Event){ t + proc->remaining, EV_CPU_DONE, pi, proc->run_gen });
+                ev_push((Event){ t + (proc->remaining < p.t_slice ? proc->remaining : p.t_slice),
+                                 EV_SLICE_EXP, pi, proc->run_gen });
                 break;
             }
 
             proc->remaining -= p.t_slice;
             proc->num_preempt++;
             cpu_busy += p.t_slice;
-            rq_push_tail(pi);
+            proc->run_gen++;
             printf("time %dms: Time slice expired; preempting process %s with %dms remaining ",
                    t, proc->id, proc->remaining);
-            print_rq_excluding(pi);
+            print_rq();
             printf("\n");
             cpu_running = -1;
-            cpu_free_at = t + p.t_cs;
-            do_dispatch(t, cpu_free_at - half, half, &cpu_running);
+            cpu_free_at = t + half;
+            ev_push((Event){ t + half, EV_RR_REQUEUE, pi, 0 });
+            do_dispatch(t, cpu_free_at, half, &cpu_running);
             break;
 
         case EV_CPU_DONE: {
+            if (proc->cpu_bursts[proc->burst_idx] <= p.t_slice)
+                proc->bursts_in_slice++;
             cpu_busy += proc->remaining;
             proc->remaining = 0;
             int bursts_left = proc->num_bursts - proc->burst_idx - 1;

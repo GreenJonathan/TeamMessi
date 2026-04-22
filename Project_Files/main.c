@@ -83,7 +83,7 @@ int main(int argc, char *argv[])
 
     int    opt_mode = 0;
     double alpha    = 0.0;
-    if (strcasecmp(argv[7], "n/a") == 0) {
+    if (strcasecmp(argv[7], "n/a") == 0 || strcmp(argv[7], "-1") == 0) {
         opt_mode = 1;
         alpha    = 0.0;
     } else {
