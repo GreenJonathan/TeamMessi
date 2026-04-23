@@ -23,6 +23,7 @@ typedef struct {
     int  bursts_done;
     int  bursts_in_slice;
     double tau;
+    double tau_rem;
     int  run_gen;
 } SimProc;
 
@@ -112,6 +113,11 @@ static int key_sjf(SimProc *sp, int i, int opt) {
         return sp[i].cpu_bursts[sp[i].burst_idx];
     }
     return (int)ceil(sp[i].tau - 1e-9);
+}
+
+static int key_srt(SimProc *sp, int i, int opt) {
+    if (opt) return sp[i].remaining;
+    return (int)ceil(sp[i].tau_rem - 1e-9);
 }
 
 static void collect_stats(SimProc *sp, int n, long cpu_busy, int sim_end,
@@ -317,37 +323,61 @@ static void run_sjf_like(SimProc *sp, int n, SimParams p, SimStats *out,
         case EV_IO_DONE: {
             proc->ready_at = t;
             proc->burst_rq_enter = t;
+            proc->tau_rem = proc->tau;
 
             if (preemptive && cpu_running != -1) {
                 SimProc *runp = &sp[cpu_running];
-                int run_key = opt ? runp->remaining : (int)ceil(runp->tau - 1e-9);
                 int new_key = opt ? proc->cpu_bursts[proc->burst_idx]
                                   : (int)ceil(proc->tau - 1e-9);
-                if (new_key < run_key ||
-                    (new_key == run_key && strcmp(proc->id, runp->id) < 0)) {
-                    int remaining = runp->remaining - (t - runp->cpu_start_time);
-                    if (remaining < 0) remaining = 0;
-                    runp->remaining = remaining;
-                    runp->ready_at = t;
-                    runp->num_preempt++;
-                    cpu_busy += (long)(t - runp->cpu_start_time);
-                    runp->run_gen++;
-                    rq_insert_sorted(cpu_running, key_sjf, opt);
-                    printf("time %dms: Process %s %s; preempting %s ", t, proc->id,
-                           e.type == EV_ARRIVE ? "arrived" : "completed I/O",
-                           runp->id);
-                    print_rq();
-                    printf("\n");
-                    rq_insert_sorted(pi, key_sjf, opt);
-                    cpu_running = -1;
-                    cpu_free_at = t + p.t_cs;
-                    if (!rq_empty())
-                        do_dispatch(t, cpu_free_at - half, half, &cpu_running);
-                    break;
+
+                if (runp->cpu_start_time < 0) {
+                    int pending_key = opt ? runp->remaining
+                                          : (int)ceil(runp->tau_rem - 1e-9);
+                    if (new_key < pending_key ||
+                        (new_key == pending_key && strcmp(proc->id, runp->id) < 0)) {
+                        runp->run_gen++;
+                        rq_insert_sorted(cpu_running, key_srt, opt);
+                        rq_insert_sorted(pi, key_srt, opt);
+                        cpu_running = -1;
+                        if (!rq_empty())
+                            do_dispatch(t, cpu_free_at, half, &cpu_running);
+                        break;
+                    }
+                } else {
+                    int elapsed = t - runp->cpu_start_time;
+                    int run_key = opt
+                        ? runp->remaining - elapsed
+                        : (int)ceil(runp->tau_rem - elapsed - 1e-9);
+                    if (run_key < 0) run_key = 0;
+                    if (new_key < run_key ||
+                        (new_key == run_key && strcmp(proc->id, runp->id) < 0)) {
+                        int remaining = runp->remaining - (t - runp->cpu_start_time);
+                        if (remaining < 0) remaining = 0;
+                        runp->remaining = remaining;
+                        runp->tau_rem -= elapsed;
+                        if (runp->tau_rem < 0.0) runp->tau_rem = 0.0;
+                        runp->ready_at = t + half;
+                        runp->num_preempt++;
+                        cpu_busy += (long)(t - runp->cpu_start_time);
+                        runp->cpu_start_time = -1;
+                        runp->run_gen++;
+                        rq_insert_sorted(cpu_running, key_srt, opt);
+                        printf("time %dms: Process %s %s; preempting %s ", t, proc->id,
+                               e.type == EV_ARRIVE ? "arrived" : "completed I/O",
+                               runp->id);
+                        print_rq();
+                        printf("\n");
+                        rq_insert_sorted(pi, key_srt, opt);
+                        cpu_running = -1;
+                        cpu_free_at = t + p.t_cs;
+                        if (!rq_empty())
+                            do_dispatch(t, cpu_free_at - half, half, &cpu_running);
+                        break;
+                    }
                 }
             }
 
-            rq_insert_sorted(pi, key_sjf, opt);
+            rq_insert_sorted(pi, preemptive ? key_srt : key_sjf, opt);
             printf("time %dms: Process %s %s; added to ready queue ", t, proc->id,
                    e.type == EV_ARRIVE ? "arrived" : "completed I/O");
             print_rq();
@@ -361,9 +391,10 @@ static void run_sjf_like(SimProc *sp, int n, SimParams p, SimStats *out,
             int burst_total = proc->cpu_bursts[proc->burst_idx];
             if (proc->remaining == 0)
                 proc->remaining = burst_total;
+            if (!opt && proc->tau_rem <= 0.0)
+                proc->tau_rem = proc->tau;
             proc->cpu_start_time = t;
-            if (proc->remaining == burst_total)
-                proc->total_wait += (long)(t - half - proc->ready_at);
+            proc->total_wait += (long)(t - half - proc->ready_at);
             proc->num_cs++;
             if (proc->remaining == burst_total)
                 printf("time %dms: Process %s started using the CPU for %dms burst ",
@@ -391,6 +422,7 @@ static void run_sjf_like(SimProc *sp, int n, SimParams p, SimStats *out,
 
             if (!opt) {
                 proc->tau = ceil(p.alpha * actual + (1.0 - p.alpha) * proc->tau - 1e-9);
+                proc->tau_rem = proc->tau;
                 printf("time %dms: Recalculated tau for process %s to %dms ", t,
                        proc->id, (int)ceil(proc->tau - 1e-9));
                 print_rq();
@@ -413,6 +445,8 @@ static void run_sjf_like(SimProc *sp, int n, SimParams p, SimStats *out,
 
             proc->burst_idx++;
             proc->remaining = 0;
+            proc->cpu_start_time = -1;
+            if (opt) proc->tau_rem = 0.0;
             cpu_running = -1;
             cpu_free_at = t + half;
             if (!rq_empty())
@@ -597,6 +631,8 @@ void run_simulation(const Process *procs, int n, AlgoType algo,
         sp[i].cpu_bursts   = procs[i].cpu_bursts;
         sp[i].io_bursts    = procs[i].io_bursts;
         sp[i].tau          = (double)params.init_tau_ms;
+        sp[i].tau_rem      = sp[i].tau;
+        sp[i].cpu_start_time = -1;
     }
 
     int opt = (params.alpha == 0.0);
